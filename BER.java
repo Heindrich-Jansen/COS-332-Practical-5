@@ -250,17 +250,4 @@ public class BER {
 		}
 		return data;
 	}
-
-	public static void main(String[] args) throws Exception {
-		byte[] encoded = BER.encodeSequence(List.of(
-				BER.encodeInteger(5),
-				BER.encodeBoolean(true),
-				BER.encodeOctetString("ldap")
-		));
-
-		BerValue decoded = BER.decodeSingle(encoded);
-		System.out.println("Outer tag class: " + decoded.tagClass);
-		System.out.println("Outer tag number: " + decoded.tagNumber);
-		System.out.println("Children: " + decoded.asSequence().size());
-	}
 }
