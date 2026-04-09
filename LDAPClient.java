@@ -1,10 +1,7 @@
 import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Scanner;
 
@@ -13,25 +10,12 @@ public class LDAPClient {
     private static final int PORT = 389;
     private static final String BIND_DN = "cn=admin,dc=prac5,dc=com";
     private static final String BIND_PASS = "admin";
-    private static final int LDAP_VERSION = 3;
+    private static final String BASE_DN = "ou=Planes,dc=prac5,dc=com";
 
-    // Control ::= SEQUENCE { controlType LDAPOID, criticality BOOLEAN DEFAULT FALSE, controlValue OCTET STRING OPTIONAL }
-    static final class LdapControl {
-        final String controlType;
-        final boolean criticality;
-        final byte[] controlValue;
-
-        LdapControl(String controlType, boolean criticality, byte[] controlValue) {
-            this.controlType = controlType;
-            this.criticality = criticality;
-            this.controlValue = controlValue;
-        }
-    }
-
-    public static void main(String[] args) {
+public static void main(String[] args) {
         Scanner scanner = new Scanner(System.in);
-        System.out.print("Press Enter to send simple BindRequest: ");
-        scanner.nextLine();
+        System.out.print("Enter asset name (e.g., Boeing 747): ");
+        String assetName = scanner.nextLine().trim();
 
         try (Socket socket = new Socket(SERVER_IP, PORT);
              InputStream in = socket.getInputStream();
@@ -39,85 +23,118 @@ public class LDAPClient {
 
             System.out.println("\n[+] Connected to LDAP Server at " + SERVER_IP + ":" + PORT);
 
-            // ASN.1 envelope: LDAPMessage ::= SEQUENCE { messageID, protocolOp, controls OPTIONAL }
-            byte[] bindOp = encodeSimpleBindRequest(BIND_DN, BIND_PASS);
-            byte[] bindMessage = encodeLdapMessage(1, bindOp, List.of());
+            // ==========================================
+            // STEP 1: SEND BIND REQUEST (Authentication)
+            // ==========================================
+            // BindRequest ::= [APPLICATION 0] IMPLICIT SEQUENCE
+            ByteArrayOutputStream bindContent = new ByteArrayOutputStream();
+            bindContent.write(BER.encodeInteger(3)); // version
+            bindContent.write(BER.encodeOctetString(BIND_DN)); // name
+            bindContent.write(BER.encodeContextSpecific(0, false, BIND_PASS.getBytes())); // authentication
+            
+            byte[] bindOp = BER.encodeApplication(0, true, bindContent.toByteArray());
+
+            // Message Envelope: SEQUENCE { messageID(1), protocolOp }
+            byte[] bindMessage = BER.encodeSequence(List.of(BER.encodeInteger(1), bindOp));
             out.write(bindMessage);
             out.flush();
 
             // Read Bind Response
             BER.BerValue bindResponseMsg = BER.decode(in);
-            int resultCode = parseBindResultCode(bindResponseMsg);
+            List<BER.BerValue> bindSeq = bindResponseMsg.asSequence();
+            BER.BerValue bindProtocolOp = bindSeq.get(1); // [APPLICATION 1] BindResponse
+
+            // The resultCode is the first element in the BindResponse sequence. 0 = Success.
+            int resultCode = bindProtocolOp.asSequence().get(0).value[0];
             if (resultCode != 0) {
                 System.out.println("[-] Bind failed with result code: " + resultCode);
                 return;
             }
             System.out.println("[+] Bind successful!");
+
+            // ==========================================
+            // STEP 2: SEND SEARCH REQUEST
+            // ==========================================
+            ByteArrayOutputStream filterContent = new ByteArrayOutputStream();
+            filterContent.write(BER.encodeOctetString("cn"));
+            filterContent.write(BER.encodeOctetString(assetName));
+            byte[] filter = BER.encodeContextSpecific(3, true, filterContent.toByteArray());
+
+            byte[] attributes = BER.encodeSequence(List.of(BER.encodeOctetString("description")));
+
+            // SearchRequest ::= [APPLICATION 3] IMPLICIT SEQUENCE
+            ByteArrayOutputStream searchContent = new ByteArrayOutputStream();
+            searchContent.write(BER.encodeOctetString(BASE_DN));
+            searchContent.write(BER.encodeInteger(2)); // Scope: 2 = wholeSubtree
+            searchContent.write(BER.encodeInteger(0)); // DerefAliases
+            searchContent.write(BER.encodeInteger(0)); // SizeLimit
+            searchContent.write(BER.encodeInteger(0)); // TimeLimit
+            searchContent.write(BER.encodeBoolean(false)); // TypesOnly
+            searchContent.write(filter);
+            searchContent.write(attributes);
+
+            byte[] searchOp = BER.encodeApplication(3, true, searchContent.toByteArray());
+
+            // Message Envelope: SEQUENCE { messageID(2), protocolOp }
+            byte[] searchMessage = BER.encodeSequence(List.of(BER.encodeInteger(2), searchOp));
+            out.write(searchMessage);
+            out.flush();
+            System.out.println("[+] Search request sent for: " + assetName);
+
+            // ==========================================
+            // STEP 3: READ AND UNPACK SEARCH RESPONSES
+            // ==========================================
+            boolean found = false;
+
+            while (true) {
+                BER.BerValue msg = BER.decode(in);
+                List<BER.BerValue> seq = msg.asSequence();
+                BER.BerValue protocolOp = seq.get(1);
+
+                if (protocolOp.tagClass == BER.TAG_CLASS_APPLICATION) {
+                    if (protocolOp.tagNumber == 5) { 
+                        // SearchResultDone
+                        break; 
+                    } 
+                    else if (protocolOp.tagNumber == 4) { 
+                        // SearchResultEntry
+                        List<BER.BerValue> entryParts = protocolOp.asSequence();
+                        List<BER.BerValue> attrsList = entryParts.get(1).asSequence();
+
+                        for (BER.BerValue attr : attrsList) {
+                            List<BER.BerValue> attrParts = attr.asSequence(); 
+                            String type = attrParts.get(0).asString();
+                            
+                            if ("description".equalsIgnoreCase(type)) {
+                                List<BER.BerValue> vals = attrParts.get(1).asSequence(); 
+                                String speed = vals.get(0).asString();
+                                
+                                System.out.println("-------------------------------------------------");
+                                System.out.println(" SUCCESS: The maximum speed of " + assetName + " is " + speed + " km/h");
+                                System.out.println("-------------------------------------------------");
+                                found = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!found) {
+                System.out.println("[-] Asset '" + assetName + "' was not found or has no speed description.");
+            }
+
+            // ==========================================
+            // STEP 4: SEND UNBIND REQUEST (Graceful Disconnect)
+            // ==========================================
+            byte[] unbindOp = BER.encodeApplication(2, false, new byte[0]);
+            byte[] unbindMessage = BER.encodeSequence(List.of(BER.encodeInteger(3), unbindOp));
+            out.write(unbindMessage);
+            out.flush();
+            System.out.println("[+] Unbind request sent. Safely disconnecting...");
+
         } catch (Exception e) {
-            System.out.println("[-] LDAP client failed: " + e.getMessage());
+            System.out.println("[-] Error communicating with LDAP server:");
             e.printStackTrace();
         }
     }
-
-    // BindRequest ::= [APPLICATION 0] SEQUENCE { version INTEGER, name LDAPDN, authentication CHOICE { simple [0] OCTET STRING } }
-    private static byte[] encodeSimpleBindRequest(String bindDn, String password) throws IOException {
-        byte[] bindRequestSequence = BER.encodeSequence(List.of(
-                BER.encodeInteger(LDAP_VERSION),
-                BER.encodeOctetString(bindDn),
-                BER.encodeContextSpecific(0, false, password.getBytes(StandardCharsets.UTF_8))
-        ));
-        return BER.encodeApplication(0, true, bindRequestSequence);
-    }
-
-    // LDAPMessage ::= SEQUENCE { messageID MessageID, protocolOp CHOICE, controls [0] Controls OPTIONAL }
-    private static byte[] encodeLdapMessage(int messageId, byte[] protocolOp, List<LdapControl> controls) throws IOException {
-        List<byte[]> envelopeFields = new ArrayList<>();
-        envelopeFields.add(BER.encodeInteger(messageId));
-        envelopeFields.add(protocolOp);
-
-        if (controls != null && !controls.isEmpty()) {
-            byte[] controlsSequence = encodeControls(controls);
-            // Optional controls are context-specific [0], constructed.
-            envelopeFields.add(BER.encodeContextSpecific(0, true, controlsSequence));
-        }
-
-        return BER.encodeSequence(envelopeFields);
-    }
-
-    // Controls ::= SEQUENCE OF control Control
-    private static byte[] encodeControls(List<LdapControl> controls) throws IOException {
-        List<byte[]> encodedControls = new ArrayList<>();
-        for (LdapControl control : controls) {
-            List<byte[]> fields = new ArrayList<>();
-            fields.add(BER.encodeOctetString(control.controlType));
-            if (control.criticality) {
-                fields.add(BER.encodeBoolean(true));
-            }
-            if (control.controlValue != null) {
-                fields.add(BER.encodeOctetString(control.controlValue));
-            }
-            encodedControls.add(BER.encodeSequence(fields));
-        }
-        return BER.encodeSequence(encodedControls);
-    }
-
-    private static int parseBindResultCode(BER.BerValue ldapMessage) throws IOException {
-        List<BER.BerValue> top = ldapMessage.asSequence();
-        if (top.size() < 2) {
-            throw new IOException("Malformed LDAPMessage: missing protocolOp");
-        }
-
-        BER.BerValue protocolOp = top.get(1);
-        if (protocolOp.tagClass != BER.TAG_CLASS_APPLICATION || protocolOp.tagNumber != 1) {
-            throw new IOException("Expected BindResponse [APPLICATION 1]");
-        }
-
-        List<BER.BerValue> bindResponseFields = BER.decodeAll(new java.io.ByteArrayInputStream(protocolOp.value));
-        if (bindResponseFields.isEmpty()) {
-            throw new IOException("Malformed BindResponse: missing resultCode");
-        }
-
-        return (int) bindResponseFields.get(0).asInteger();
-    }
-
 }
